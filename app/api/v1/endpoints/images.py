@@ -1,12 +1,12 @@
 """
-Media upload endpoint  (/api/v1/media/upload)
+Media upload endpoint (`/api/v1/media/upload`).
 
-Accepts both images and videos and runs the full 9-agent LangGraph pipeline:
+Accepts image and video files, then runs the complete 9-agent LangGraph pipeline:
 
-  Upload Agent → File Type Classifier
-       ├── Image Agent → AI Detection → Decision
-       │                                   ├── REAL          → Store File
-       └── Video Agent → AI Detection →    └── AI_GENERATED → Watermark → Store Result
+    Upload Agent → File Type Classifier
+             ├── Image Agent → AI Detection → Decision
+             │                                   ├── REAL          → Store File
+             └── Video Agent → AI Detection →    └── AI_GENERATED → Watermark → Store Result
 """
 from __future__ import annotations
 
@@ -44,16 +44,16 @@ Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 )
 async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
     """
-    Accepts an image (JPEG, PNG, GIF, WebP) or a video (MP4, MPEG, MOV, AVI, WebM).
+    Accept an image (JPEG, PNG, GIF, WebP) or video (MP4, MPEG, MOV, AVI, WebM).
 
-    Runs the full 9-agent LangGraph pipeline and returns:
-    - Extracted metadata
-    - OpenAI AI-generation analysis
-    - Decision (REAL | AI_GENERATED)
-    - Storage path (stored_file_path or watermarked_file_path)
-    - Full agent processing log
+    Runs the full pipeline and returns:
+    - extracted metadata
+    - OpenAI analysis
+    - decision (`DEEP_FAKE`, `AI_GENERATED`, `DIGITALLY_EDITED`, `REAL`, or `OTHER`)
+    - output path (`stored_file_path` or `watermarked_file_path`)
+    - full processing log
     """
-    # Validate content type 
+    # Validate content type.
     content_type = file.content_type or ""
     if content_type not in ALLOWED_MEDIA_TYPES:
         raise HTTPException(
@@ -67,7 +67,7 @@ async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
     content = await file.read()
     size_bytes = len(content)
 
-    # Validate size (images vs videos have different limits)
+    # Validate size (images and videos have different limits).
     is_video = content_type.startswith("video/")
     max_mb = MAX_VIDEO_SIZE_MB if is_video else MAX_IMAGE_SIZE_MB
     if size_bytes > max_mb * 1024 * 1024:
@@ -76,7 +76,7 @@ async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
             detail=f"File too large. Maximum allowed size is {max_mb} MB.",
         )
 
-    # Run the full pipeline in a thread (keeps event loop free)
+    # Run the pipeline in a worker thread to keep the event loop responsive.
     loop = asyncio.get_running_loop()
     pipeline_result = await loop.run_in_executor(
         _executor,
@@ -89,14 +89,14 @@ async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
         ),
     )
 
-    # ── Surface pipeline errors as HTTP 422 
+    # Surface pipeline failures as HTTP 422.
     if pipeline_result.get("error"):
         raise HTTPException(
             status_code=422,
             detail=pipeline_result["error"],
         )
 
-    #Persist record to DB 
+    # Try to persist the result in the database.
     db = None
     try:
         db = SessionLocal()
@@ -115,13 +115,13 @@ async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
         db.add(record)
         db.commit()
     except Exception:
-        # DB errors must not mask a successful pipeline result
+        # Do not hide a successful pipeline result because of a DB write issue.
         pass
     finally:
         if db:
             db.close()
 
-    # Build and return response 
+    # Build and return API response.
     return MediaResponse(
         filename=file.filename,
         content_type=content_type,

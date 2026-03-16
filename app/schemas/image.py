@@ -6,28 +6,36 @@ from pydantic import BaseModel
 class MediaResponse(BaseModel):
     """Unified response for the /media/upload endpoint."""
 
-    # ── File identity ─────────────────────────────────────────────────────────
+    # Basic file identity.
     filename: Optional[str] = None
     content_type: Optional[str] = None
     size_bytes: Optional[int] = None
 
-    # ── Pipeline outputs ──────────────────────────────────────────────────────
+    # Pipeline outputs.
     media_type: Optional[Literal["image", "video", "unknown"]] = None
     metadata: Optional[dict[str, Any]] = None
     ai_analysis: Optional[str] = None
     ai_detection_result: Optional[Literal["AI_GENERATED", "NOT_AI_GENERATED"]] = None
-    decision: Optional[Literal["REAL", "AI_GENERATED"]] = None
+    decision: Optional[
+        Literal[
+            "DEEP_FAKE",
+            "AI_GENERATED",
+            "DIGITALLY_EDITED",
+            "REAL",
+            "OTHER",
+        ]
+    ] = None
 
-    # ── Storage paths ─────────────────────────────────────────────────────────
-    stored_file_path: Optional[str] = None        # set when decision == REAL
-    watermarked_file_path: Optional[str] = None   # set when decision == AI_GENERATED
+    # Output storage paths.
+    stored_file_path: Optional[str] = None        # Present when decision == REAL.
+    watermarked_file_path: Optional[str] = None   # Present when decision == AI_GENERATED.
 
-    # ── Audit trail ───────────────────────────────────────────────────────────
+    # Processing audit trail.
     processing_log: list[str] = []
 
     class Config:
         from_attributes = True
 
 
-# Back-compat alias so any code still importing ImageResponse keeps working
+# Backward-compatible alias for older imports.
 ImageResponse = MediaResponse

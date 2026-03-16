@@ -1,29 +1,29 @@
 """
-Multi-agent LangGraph pipeline for media AI-detection and processing.
+LangGraph-based media processing pipeline for AI-origin detection.
 
-Diagram flow
-────────────
-User Upload
-    │
-    ▼
-Upload Agent          ← validates file, initialises processing log
-    │
-    ▼
-File Type Classifier  ← routes to Image Agent or Video Agent
-    │
-  ┌─┴─────────────┐
-  ▼               ▼
-Image Agent   Video Agent   ← extract rich metadata
-  └──────┬────────┘
-         ▼
-  AI Detection Agent        ← OpenAI vision / text analysis
-         │
-         ▼
-  Decision Agent            ← REAL ──► Store File Agent ──► END
-                              AI_GENERATED ──► Watermark Agent
-                                                  │
-                                                  ▼
-                                           Store Result Agent ──► END
+Flow overview
+-------------
+User upload
+        │
+        ▼
+Upload Agent            ← validates input and starts a processing log
+        │
+        ▼
+File Type Classifier    ← routes to Image Agent or Video Agent
+        │
+    ┌─┴─────────────┐
+    ▼               ▼
+Image Agent   Video Agent   ← extract media metadata
+    └──────┬────────┘
+                 ▼
+AI Detection Agent      ← OpenAI vision/text analysis
+                 │
+                 ▼
+Decision Agent          ← REAL ──► Store File Agent ──► END
+                                                 AI_GENERATED ──► Watermark Agent
+                                                                                         │
+                                                                                         ▼
+                                                                            Store Result Agent ──► END
 """
 from __future__ import annotations
 
@@ -38,9 +38,7 @@ from typing import Any, Literal, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from PIL import Image, ImageDraw, ImageFont
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Media type registries
-# ─────────────────────────────────────────────────────────────────────────────
+# Supported media type registries
 
 IMAGE_CONTENT_TYPES: frozenset[str] = frozenset({
     "image/jpeg",
@@ -60,35 +58,37 @@ VIDEO_CONTENT_TYPES: frozenset[str] = frozenset({
 ALLOWED_MEDIA_TYPES: frozenset[str] = IMAGE_CONTENT_TYPES | VIDEO_CONTENT_TYPES
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline state
-# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline state model
 
 class MediaPipelineState(TypedDict, total=False):
-    # ── Inputs ────────────────────────────────────────────────────────────────
+    # Input values
     file_bytes: bytes
     original_filename: str
     content_type: str
     upload_dir: str
     openai_api_key: str
 
-    # ── Intermediate ──────────────────────────────────────────────────────────
+    # Intermediate values
     media_type: Literal["image", "video", "unknown"]
     metadata: dict[str, Any]
     ai_analysis: str
     ai_detection_result: Literal["AI_GENERATED", "NOT_AI_GENERATED"]
-    decision: Literal["REAL", "AI_GENERATED"]
+    decision: Literal[
+        "DEEP_FAKE",
+        "AI_GENERATED",
+        "DIGITALLY_EDITED",
+        "REAL",
+        "OTHER",
+    ]
 
-    # ── Outputs ───────────────────────────────────────────────────────────────
+    # Output values
     stored_file_path: str
     watermarked_file_path: str
     processing_log: list[str]
     error: Optional[str]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Internal helper utilities
 
 def _append_log(state: MediaPipelineState, message: str) -> list[str]:
     log: list[str] = list(state.get("processing_log") or [])
@@ -101,12 +101,10 @@ def _unique_path(upload_dir: Path, stem: str, suffix: str, tag: str = "") -> Pat
     return upload_dir / f"{stem}_{uuid.uuid4().hex}{tag_part}{suffix}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 1 – Upload Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def upload_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Validates the incoming file and initialises the processing log."""
+    """Validate incoming file data and initialize the processing log."""
     if not state.get("file_bytes"):
         return {
             "error": "No file content received.",
@@ -126,12 +124,10 @@ def upload_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"processing_log": _append_log(state, msg)}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 2 – File Type Classifier Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def file_type_classifier_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Classifies upload as 'image', 'video', or 'unknown' and routes accordingly."""
+    """Classify the upload as image, video, or unknown for downstream routing."""
     ct = (state.get("content_type") or "").lower()
     if ct in IMAGE_CONTENT_TYPES:
         media_type: Literal["image", "video", "unknown"] = "image"
@@ -144,19 +140,17 @@ def file_type_classifier_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"media_type": media_type, "processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 3 – Image Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def image_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Extracts full image metadata (dimensions, mode, EXIF, colour stats) via Pillow."""
+    """Extract rich image metadata (size, mode, EXIF, and color statistics)."""
     with Image.open(BytesIO(state["file_bytes"])) as img:
         exif_raw = img.getexif()
         exif: dict[str, str] = (
             {str(k): str(v) for k, v in exif_raw.items()} if exif_raw else {}
         )
 
-        # Basic colour statistics for the first 3 channels
+        # Basic color statistics for the first three channels
         colour_stats: dict[str, Any] = {}
         try:
             from PIL import ImageStat
@@ -191,12 +185,10 @@ def image_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"metadata": metadata, "processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 4 – Video Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def video_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Extracts video container metadata from binary headers (no ffmpeg required)."""
+    """Extract video container metadata from binary headers (FFmpeg not required)."""
     raw = state["file_bytes"]
 
     container = "unknown"
@@ -235,18 +227,16 @@ def video_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"metadata": metadata, "processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 5 – AI Detection Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
-    Calls OpenAI to determine whether the media was AI-generated.
+    Use OpenAI to estimate whether media appears AI-generated.
 
-    • Images  → GPT-4.1-mini vision with base64 data-URL
-    • Videos  → GPT-4.1-mini text analysis of extracted metadata
+    • Images  → GPT-4o vision with a base64 data URL
+    • Videos  → GPT-4o text analysis based on extracted metadata
     """
-    from openai import OpenAI  # local import; avoids circular deps at module load
+    from openai import OpenAI  # Local import to avoid module-load side effects.
 
     api_key = state.get("openai_api_key") or ""
     if not api_key:
@@ -266,7 +256,7 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
         data_url = f"data:{mime};base64,{img_b64}"
 
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": [
@@ -279,6 +269,7 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
                             "unnatural textures, or generative model signatures.\n\n"
                             "Respond EXACTLY in this format:\n"
                             "RESULT: AI_GENERATED or NOT_AI_GENERATED\n"
+                            "CLASSIFICATION: DEEP_FAKE or AI_GENERATED or DIGITALLY_EDITED or REAL or OTHER\n"
                             "ANALYSIS: <concise explanation>"
                         ),
                     },
@@ -288,10 +279,10 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
             max_tokens=400,
         )
     else:
-        # Video: send metadata as context for text-based analysis
+        # For video, send extracted metadata as text context.
         meta_str = json.dumps(state.get("metadata") or {}, indent=2)
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": (
@@ -300,6 +291,7 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
                     f"```json\n{meta_str}\n```\n\n"
                     "Respond EXACTLY in this format:\n"
                     "RESULT: AI_GENERATED or NOT_AI_GENERATED\n"
+                    "CLASSIFICATION: DEEP_FAKE or AI_GENERATED or DIGITALLY_EDITED or REAL or OTHER\n"
                     "ANALYSIS: <concise explanation>"
                 ),
             }],
@@ -308,7 +300,7 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
 
     raw_reply: str = response.choices[0].message.content.strip()
 
-    # Parse structured result
+    # Parse the structured RESULT line from the model response.
     detection: Literal["AI_GENERATED", "NOT_AI_GENERATED"] = "NOT_AI_GENERATED"
     for line in raw_reply.splitlines():
         if line.upper().startswith("RESULT:"):
@@ -327,30 +319,63 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 6 – Decision Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def decision_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
-    Translates AI detection result into a routing decision.
-    NOT_AI_GENERATED → REAL (store as-is)
-    AI_GENERATED     → AI_GENERATED (watermark, then store)
+    Classify media into one of:
+    DEEP_FAKE, AI_GENERATED, DIGITALLY_EDITED, REAL, OTHER.
+
+    Priority:
+    1) explicit CLASSIFICATION line from the model output
+    2) fallback from ai_detection_result
     """
     result = state.get("ai_detection_result", "NOT_AI_GENERATED")
-    decision: Literal["REAL", "AI_GENERATED"] = (
-        "AI_GENERATED" if result == "AI_GENERATED" else "REAL"
+    raw = (state.get("ai_analysis") or "").upper()
+
+    allowed: tuple[str, ...] = (
+        "DEEP_FAKE",
+        "AI_GENERATED",
+        "DIGITALLY_EDITED",
+        "REAL",
+        "OTHER",
     )
+
+    decision: Literal[
+        "DEEP_FAKE",
+        "AI_GENERATED",
+        "DIGITALLY_EDITED",
+        "REAL",
+        "OTHER",
+    ] = "OTHER"
+
+    # Preferred parse path: explicit CLASSIFICATION line.
+    for line in raw.splitlines():
+        if line.startswith("CLASSIFICATION:"):
+            token = line.split(":", 1)[1].strip().replace("-", "_").replace(" ", "_")
+            if token in allowed:
+                decision = token  # type: ignore[assignment]
+                break
+
+    # Fallback heuristics if CLASSIFICATION was not provided.
+    if decision == "OTHER":
+        if "DEEP_FAKE" in raw or "DEEPFAKE" in raw:
+            decision = "DEEP_FAKE"
+        elif "DIGITALLY_EDITED" in raw or "DIGITALLY EDITED" in raw:
+            decision = "DIGITALLY_EDITED"
+        elif result == "AI_GENERATED":
+            decision = "AI_GENERATED"
+        elif result == "NOT_AI_GENERATED":
+            decision = "REAL"
+
     log = _append_log(state, f"decision_agent: routing decision='{decision}'")
     return {"decision": decision, "processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Agent 7 – Store File Agent  (REAL branch)
-# ─────────────────────────────────────────────────────────────────────────────
+# Agent 7 – Store File Agent (REAL branch)
 
 def store_file_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Persists a REAL (non-AI) media file to the upload directory."""
+    """Save REAL (non-AI) media to the upload directory."""
     upload_dir = Path(state["upload_dir"])
     upload_dir.mkdir(parents=True, exist_ok=True)
 
@@ -364,16 +389,14 @@ def store_file_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"stored_file_path": str(dest), "processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Agent 8 – Watermark Agent  (AI_GENERATED branch)
-# ─────────────────────────────────────────────────────────────────────────────
+# Agent 8 – Watermark Agent (AI_GENERATED branch)
 
 def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
-    Stamps a visible 'AI GENERATED' watermark on flagged media.
+    Add visible AI-generated marking for flagged media.
 
-    • Images  → Pillow alpha-composite red banner at bottom centre
-    • Videos  → Original file saved + JSON sidecar flagging AI detection
+    • Images  → Pillow alpha-composited banner near the bottom center
+    • Videos  → Original file + JSON sidecar with AI flag details
     """
     upload_dir = Path(state["upload_dir"])
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -390,11 +413,11 @@ def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
             draw = ImageDraw.Draw(overlay)
 
             w, h = rgba.size
-            text = "⚠  AI GENERATED"
+            text = "  AI GENERATED"
             font_size = max(28, w // 18)
 
             try:
-                # Try common system fonts
+                # Try a few commonly available system fonts.
                 for face in ("arial.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf"):
                     try:
                         font = ImageFont.truetype(face, size=font_size)
@@ -412,7 +435,7 @@ def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
             pad = max(14, h // 40)
             y = h - th - pad * 2
 
-            # Semi-transparent dark-red banner
+            # Draw a semi-transparent dark-red banner.
             draw.rectangle(
                 [0, y - pad, w, y + th + pad],
                 fill=(160, 0, 0, 190),
@@ -429,7 +452,7 @@ def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
         return {"watermarked_file_path": str(wm_path), "processing_log": log}
 
     else:
-        # Video: save raw bytes + JSON sidecar
+        # For video, save raw bytes and write a JSON sidecar.
         dest = _unique_path(upload_dir, stem, suffix, tag="ai_flagged")
         dest.write_bytes(state["file_bytes"])
         sidecar = dest.with_suffix(".ai_flag.json")
@@ -453,12 +476,10 @@ def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
         return {"watermarked_file_path": str(dest), "processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Agent 9 – Store Result Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 def store_result_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Final bookkeeping node – confirms watermarked result is persisted."""
+    """Final bookkeeping step that confirms result persistence."""
     wm = state.get("watermarked_file_path", "—")
     log = _append_log(
         state,
@@ -467,9 +488,7 @@ def store_result_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"processing_log": log}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Conditional routing functions
-# ─────────────────────────────────────────────────────────────────────────────
+# Conditional routing helpers
 
 def _route_by_media_type(state: MediaPipelineState) -> str:
     if state.get("error"):
@@ -485,18 +504,16 @@ def _route_by_media_type(state: MediaPipelineState) -> str:
 def _route_by_decision(state: MediaPipelineState) -> str:
     return (
         "watermark_agent"
-        if state.get("decision") == "AI_GENERATED"
+        if state.get("decision") in {"DEEP_FAKE", "AI_GENERATED", "DIGITALLY_EDITED"}
         else "store_file_agent"
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build & compile graph
-# ─────────────────────────────────────────────────────────────────────────────
+# Build and compile the graph
 
 _builder = StateGraph(MediaPipelineState)
 
-# Register all agents as nodes
+# Register all agents as graph nodes.
 _builder.add_node("upload_agent", upload_agent)
 _builder.add_node("file_type_classifier_agent", file_type_classifier_agent)
 _builder.add_node("image_agent", image_agent)
@@ -511,7 +528,7 @@ _builder.add_node("store_result_agent", store_result_agent)
 _builder.add_edge(START, "upload_agent")
 _builder.add_edge("upload_agent", "file_type_classifier_agent")
 
-# Branch: image or video (or END on unknown/error)
+# Branch: image/video route, or end on unknown/error.
 _builder.add_conditional_edges(
     "file_type_classifier_agent",
     _route_by_media_type,
@@ -522,12 +539,12 @@ _builder.add_conditional_edges(
     },
 )
 
-# Both media agents converge to AI detection
+# Both media branches converge into AI detection.
 _builder.add_edge("image_agent", "ai_detection_agent")
 _builder.add_edge("video_agent", "ai_detection_agent")
 _builder.add_edge("ai_detection_agent", "decision_agent")
 
-# Branch: real → store, AI-generated → watermark
+# Branch: non-REAL suspicious classes go to watermarking.
 _builder.add_conditional_edges(
     "decision_agent",
     _route_by_decision,
@@ -545,9 +562,7 @@ _builder.add_edge("store_result_agent", END)
 media_pipeline_graph = _builder.compile()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Public API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_media_pipeline(
     file_bytes: bytes,
@@ -557,10 +572,10 @@ def run_media_pipeline(
     openai_api_key: str = "",
 ) -> MediaPipelineState:
     """
-    Execute the full multi-agent media-detection pipeline.
+    Execute the full media detection pipeline.
 
-    Returns the final :class:`MediaPipelineState` containing metadata,
-    AI analysis, decision, stored paths, and the complete processing log.
+    Returns final :class:`MediaPipelineState` including metadata,
+    AI analysis, decision, output paths, and full processing log.
     """
     return media_pipeline_graph.invoke(
         {

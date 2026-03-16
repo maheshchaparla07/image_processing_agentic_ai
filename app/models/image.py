@@ -20,7 +20,7 @@ class Image(Base):
     metadata_json = Column(Text, nullable=True)          # JSON-serialised metadata dict
     ai_analysis = Column(Text, nullable=True)            # raw OpenAI reply
     ai_detection_result = Column(String(20), nullable=True)  # AI_GENERATED | NOT_AI_GENERATED
-    decision = Column(String(20), nullable=True)         # REAL | AI_GENERATED
+    decision = Column(String(20), nullable=True)         # DEEP_FAKE | AI_GENERATED | DIGITALLY_EDITED | REAL | OTHER
 
     #  Storage paths 
     stored_file_path = Column(String, nullable=True)     # REAL branch
