@@ -123,7 +123,7 @@ def _compute_ela(file_bytes: bytes, quality: int = 75) -> tuple[float, bytes]:
     layers) show higher difference values than uniformly-captured areas.
     Returns (anomaly_score, ela_png_bytes).
     """
-    from PIL import ImageChops, ImageEnhance, ImageStat
+    from PIL import ImageChops, ImageEnhance
 
     with Image.open(BytesIO(file_bytes)) as tmp:
         orig = tmp.convert("RGB")

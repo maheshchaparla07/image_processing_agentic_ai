@@ -239,15 +239,11 @@ app/
 ├── models/
 │   ├── image.py
 │   └── user.py
-├── repositories/
-│   └── user_repo.py
 ├── schemas/
 │   ├── image.py
 │   └── user.py
 └── services/
-    ├── media_pipeline_graph.py
-    ├── image_processing_graph.py
-    └── user_service.py
+  └── media_pipeline_graph.py
 docker/
 ├── Dockerfile
 └── docker-compose.yml
@@ -382,12 +378,6 @@ When a file is uploaded, runtime sequence is:
 - File too large → HTTP `400`
 - Pipeline-level failure → HTTP `422`
 - DB write failure after successful pipeline → response still succeeds
-
-## Extra module included
-
-`app/services/image_processing_graph.py` is a separate sample graph that extracts basic metadata and saves a horizontally flipped image.
-
-It is not currently wired into the active upload endpoint.
 
 ## Current limitations
 
