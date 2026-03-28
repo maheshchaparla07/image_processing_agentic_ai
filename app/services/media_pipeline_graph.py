@@ -9,13 +9,12 @@ User upload
 Upload Agent            ← validates input and starts a processing log
         │
         ▼
-File Type Classifier    ← routes to Image Agent or Video Agent
+File Type Classifier    ← routes to Image Agent
         │
-    ┌─┴─────────────┐
-    ▼               ▼
-Image Agent   Video Agent   ← extract media metadata
-    └──────┬────────┘
-                 ▼
+    ▼
+Image Agent   ← extract image metadata
+    │
+    ▼
 AI Detection Agent      ← OpenAI vision/text analysis
                  │
                  ▼
@@ -28,15 +27,27 @@ Decision Agent          ← REAL ──► Store File Agent ──► END
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
+import re
+import shutil
+import subprocess
+import tempfile
 import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from PIL.ExifTags import TAGS as EXIF_TAGS
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 # Supported media type registries
 
@@ -47,15 +58,20 @@ IMAGE_CONTENT_TYPES: frozenset[str] = frozenset({
     "image/webp",
 })
 
-VIDEO_CONTENT_TYPES: frozenset[str] = frozenset({
-    "video/mp4",
-    "video/mpeg",
-    "video/quicktime",
-    "video/x-msvideo",
-    "video/webm",
-})
+ALLOWED_MEDIA_TYPES: frozenset[str] = IMAGE_CONTENT_TYPES
 
-ALLOWED_MEDIA_TYPES: frozenset[str] = IMAGE_CONTENT_TYPES | VIDEO_CONTENT_TYPES
+EXECUTION_ORDER: tuple[str, ...] = (
+    "upload_agent",
+    "file_type_classifier_agent",
+    "image_agent",
+    "ai_detection_agent",
+    "reverification_agent",
+    "digital_edit_detection_agent",
+    "decision_agent",
+    "watermark_agent",
+    "store_file_agent",
+    "store_result_agent",
+)
 
 
 # Pipeline state model
@@ -69,12 +85,17 @@ class MediaPipelineState(TypedDict, total=False):
     openai_api_key: str
 
     # Intermediate values
-    media_type: Literal["image", "video", "unknown"]
+    media_type: Literal["image", "unknown"]
     metadata: dict[str, Any]
     ai_analysis: str
     ai_detection_result: Literal["AI_GENERATED", "NOT_AI_GENERATED"]
+    ai_confidence: float
+    confidence_scores: dict[str, Any]
+    abstention_threshold: float
+    abstained: bool
     reverification_analysis: str
     reverification_result: Literal["AI_GENERATED", "NOT_AI_GENERATED"]
+    reverification_confidence: float
     reverification_classification: Literal[
         "DEEP_FAKE",
         "AI_GENERATED",
@@ -91,6 +112,7 @@ class MediaPipelineState(TypedDict, total=False):
         "DIGITALLY_EDITED",
         "REAL",
         "OTHER",
+        "ABSTAIN",
     ]
 
     # Output values
@@ -104,13 +126,45 @@ class MediaPipelineState(TypedDict, total=False):
 
 def _append_log(state: MediaPipelineState, message: str) -> list[str]:
     log: list[str] = list(state.get("processing_log") or [])
-    log.append(message)
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    log.append(f"[{ts}] {message}")
     return log
 
 
 def _unique_path(upload_dir: Path, stem: str, suffix: str, tag: str = "") -> Path:
     tag_part = f"_{tag}" if tag else ""
     return upload_dir / f"{stem}_{uuid.uuid4().hex}{tag_part}{suffix}"
+
+
+def _extract_agent_name_from_log(entry: str) -> Optional[str]:
+    """Extract pipeline agent name from a log entry if present."""
+    msg = entry
+    if "] " in entry:
+        msg = entry.split("] ", 1)[1]
+
+    match = re.search(r"\b([a-z_]+_agent)\b", msg)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _rearrange_log_by_execution(log: list[str]) -> list[str]:
+    """Reorder processing logs by pipeline execution flow."""
+    grouped: dict[str, list[str]] = {name: [] for name in EXECUTION_ORDER}
+    unmatched: list[str] = []
+
+    for entry in log:
+        agent = _extract_agent_name_from_log(entry)
+        if agent and agent in grouped:
+            grouped[agent].append(entry)
+        else:
+            unmatched.append(entry)
+
+    ordered: list[str] = []
+    for agent in EXECUTION_ORDER:
+        ordered.extend(grouped[agent])
+    ordered.extend(unmatched)
+    return ordered
 
 
 # ELA helpers
@@ -145,6 +199,36 @@ def _compute_ela(file_bytes: bytes, quality: int = 75) -> tuple[float, bytes]:
     return anomaly_score, ela_buf.read()
 
 
+def _compute_ela_script_style(file_bytes: bytes, quality: int = 90) -> tuple[float, bytes]:
+    """
+    Script-style ELA variant for comparison with ela_analysis.py.
+
+    - Re-save JPEG at quality=90
+    - Enhance difference with brightness x15
+    - Return ELA map as JPEG bytes
+    """
+    from PIL import ImageChops, ImageEnhance
+
+    with Image.open(BytesIO(file_bytes)) as tmp:
+        orig = tmp.convert("RGB")
+
+    buf = BytesIO()
+    orig.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    recompressed = Image.open(buf).convert("RGB")
+
+    diff = ImageChops.difference(orig, recompressed)
+    from PIL import ImageStat as _IS
+    stat = _IS.Stat(diff)
+    anomaly_score = round(sum(stat.mean) / max(len(stat.mean), 1), 4)
+
+    enhanced = ImageEnhance.Brightness(diff).enhance(15.0)
+    ela_buf = BytesIO()
+    enhanced.save(ela_buf, format="JPEG", quality=95)
+    ela_buf.seek(0)
+    return anomaly_score, ela_buf.read()
+
+
 _EDITING_SOFTWARE_KEYWORDS: frozenset[str] = frozenset({
     "adobe", "photoshop", "lightroom", "gimp", "affinity", "pixelmator",
     "capture one", "darktable", "snapseed", "facetune", "meitu",
@@ -153,19 +237,301 @@ _EDITING_SOFTWARE_KEYWORDS: frozenset[str] = frozenset({
 
 
 def _detect_editing_software(exif_data: dict[str, str]) -> tuple[bool, str]:
-    """Return (found, software_name) by inspecting the EXIF Software tag (305)."""
-    software = (exif_data.get("305") or "").lower()
+    """Return (found, software_name) by inspecting the EXIF Software tag."""
+    software = (exif_data.get("Software") or "").lower()
     for kw in _EDITING_SOFTWARE_KEYWORDS:
         if kw in software:
-            return True, exif_data.get("305", "")
+            return True, exif_data.get("Software", "")
     return False, ""
+
+
+def _extract_human_readable_exif(exif_raw) -> dict[str, str]:
+    """Convert numeric EXIF tag IDs to human-readable tag names."""
+    if not exif_raw:
+        return {}
+    
+    result = {}
+    for tag_id, value in exif_raw.items():
+        tag_name = EXIF_TAGS.get(tag_id, f"Tag_{tag_id}")
+        result[tag_name] = str(value)
+    return result
+
+
+def _extract_exiftool_metadata(file_bytes: bytes, original_filename: str) -> dict[str, Any]:
+    """
+    Extract metadata using exiftool if available on PATH.
+
+    Returns a dict with status + parsed metadata payload.
+    """
+    exiftool_bin = shutil.which("exiftool")
+    if not exiftool_bin:
+        return {
+            "available": False,
+            "error": "exiftool executable not found on PATH",
+            "data": {},
+        }
+
+    suffix = Path(original_filename or "upload.bin").suffix or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        tmp.write(file_bytes)
+
+    try:
+        proc = subprocess.run(
+            [exiftool_bin, "-j", "-n", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+        if proc.returncode != 0:
+            return {
+                "available": True,
+                "error": (proc.stderr or "exiftool failed").strip(),
+                "data": {},
+            }
+
+        payload = json.loads(proc.stdout or "[]")
+        data = payload[0] if isinstance(payload, list) and payload else {}
+        if isinstance(data, dict):
+            data.pop("SourceFile", None)
+
+        return {
+            "available": True,
+            "error": "",
+            "data": data if isinstance(data, dict) else {},
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "error": str(exc),
+            "data": {},
+        }
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _extract_opencv_metadata(file_bytes: bytes) -> dict[str, Any]:
+    """Extract basic image stats with OpenCV, if OpenCV is installed."""
+    if cv2 is None:
+        return {
+            "available": False,
+            "error": "opencv-python not installed",
+            "data": {},
+        }
+
+    try:
+        arr = np.frombuffer(file_bytes, dtype=np.uint8)
+        decoded = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if decoded is None:
+            return {
+                "available": True,
+                "error": "cv2.imdecode returned None",
+                "data": {},
+            }
+
+        height, width = decoded.shape[:2]
+        channels = 1 if len(decoded.shape) == 2 else int(decoded.shape[2])
+        mean_bgr = cv2.mean(decoded)[: min(channels, 3)]
+
+        return {
+            "available": True,
+            "error": "",
+            "data": {
+                "width": int(width),
+                "height": int(height),
+                "channels": channels,
+                "dtype": str(decoded.dtype),
+                "mean_bgr": [round(float(v), 2) for v in mean_bgr],
+            },
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "error": str(exc),
+            "data": {},
+        }
+
+
+def _build_pillow_opencv_difference(
+    pillow_meta: dict[str, Any],
+    opencv_meta: dict[str, Any],
+    exif_data: dict[str, str],
+    exiftool_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a compact consistency/difference summary for model prompts."""
+    cv_data = (opencv_meta or {}).get("data") or {}
+    exiftool_data = (exiftool_meta or {}).get("data") or {}
+
+    diffs: list[str] = []
+
+    pw = pillow_meta.get("width")
+    ph = pillow_meta.get("height")
+    cw = cv_data.get("width")
+    ch = cv_data.get("height")
+    if cw is not None and ch is not None and (pw != cw or ph != ch):
+        diffs.append(f"dimension_mismatch: pillow={pw}x{ph} opencv={cw}x{ch}")
+
+    pillow_mode = str(pillow_meta.get("mode") or "")
+    expected_channels = {
+        "L": 1,
+        "LA": 2,
+        "RGB": 3,
+        "RGBA": 4,
+        "P": 1,
+    }.get(pillow_mode)
+    cv_channels = cv_data.get("channels")
+    if expected_channels is not None and cv_channels is not None and expected_channels != cv_channels:
+        diffs.append(
+            f"channel_mismatch: pillow_mode={pillow_mode}({expected_channels}) opencv_channels={cv_channels}"
+        )
+
+    exif_software = exif_data.get("Software") or ""
+    exiftool_software = str(exiftool_data.get("Software") or "")
+    if exif_software and exiftool_software and exif_software != exiftool_software:
+        diffs.append(
+            f"software_tag_mismatch: pillow_software={exif_software!r} exiftool_software={exiftool_software!r}"
+        )
+
+    return {
+        "consistency": "match" if not diffs else "mismatch",
+        "differences": diffs,
+        "opencv_available": bool((opencv_meta or {}).get("available")),
+        "exiftool_available": bool((exiftool_meta or {}).get("available")),
+    }
+
+
+def _build_authenticity_markers(metadata: dict[str, Any]) -> dict[str, Any]:
+    exif = metadata.get("exif_data") or {}
+    exiftool_data = (metadata.get("exiftool_metadata") or {}).get("data") or {}
+
+    return {
+        "camera_make": exif.get("Make") or exiftool_data.get("Make"),
+        "camera_model": exif.get("Model") or exiftool_data.get("Model"),
+        "iso": exif.get("ISOSpeedRatings") or exiftool_data.get("ISO"),
+        "gps": {
+            "lat": exif.get("GPSLatitude") or exiftool_data.get("GPSLatitude"),
+            "lon": exif.get("GPSLongitude") or exiftool_data.get("GPSLongitude"),
+        },
+    }
+
+
+def _build_synthetic_traces(metadata: dict[str, Any]) -> dict[str, Any]:
+    exif = metadata.get("exif_data") or {}
+    software = str(exif.get("Software") or "")
+    user_comment = str(exif.get("UserComment") or "")
+    markers = (
+        "midjourney",
+        "stable diffusion",
+        "dall",
+        "prompt",
+        "generated",
+        "adobe firefly",
+    )
+    combined = f"{software} {user_comment}".lower()
+    hits = [m for m in markers if m in combined]
+    return {
+        "software": software,
+        "user_comment": user_comment,
+        "markers_detected": hits,
+        "has_synthetic_markers": bool(hits),
+    }
+
+
+def _build_provenance_signals_placeholder() -> dict[str, Any]:
+    return {
+        "reverse_image_search_available": False,
+        "provider": "not_configured",
+        "matches_found": None,
+        "note": "placeholder only; external reverse image API not configured",
+    }
+
+
+def _build_error_recovery_rate_placeholder() -> dict[str, Any]:
+    return {
+        "dynamic_replanning_enabled": False,
+        "state_mismatch_detected": None,
+        "recovery_success_rate": None,
+        "note": "placeholder only; no dynamic re-planning module integrated",
+    }
+
+
+def _build_compression_analysis(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Heuristic compression/recompression analysis from metadata + ELA signals."""
+    image_format = str(metadata.get("format") or "").upper()
+    megapixels = float(metadata.get("megapixels") or 0.0)
+    exif = metadata.get("exif_data") or {}
+    exiftool_data = (metadata.get("exiftool_metadata") or {}).get("data") or {}
+
+    software = str(exif.get("Software") or exiftool_data.get("Software") or "")
+    jpeg_quality_est = exiftool_data.get("JPEGQualityEstimate")
+    compressed_tag = exif.get("Compression") or exiftool_data.get("Compression")
+
+    size_bytes = int(metadata.get("size_bytes") or 0)
+    bytes_per_mp = round(size_bytes / megapixels, 2) if size_bytes > 0 and megapixels > 0 else None
+
+    reasons: list[str] = []
+    score = 0.0
+
+    if image_format == "JPEG":
+        score += 0.35
+        reasons.append("jpeg_container_detected")
+    if compressed_tag:
+        score += 0.2
+        reasons.append(f"compression_tag_present:{compressed_tag}")
+    if software:
+        score += 0.15
+        reasons.append("software_field_present")
+    if isinstance(jpeg_quality_est, (int, float)) and jpeg_quality_est < 95:
+        score += 0.2
+        reasons.append(f"jpeg_quality_estimate:{jpeg_quality_est}")
+    if bytes_per_mp is not None and bytes_per_mp < 900_000:
+        score += 0.15
+        reasons.append(f"low_bytes_per_mp:{bytes_per_mp}")
+
+    score = max(0.0, min(score, 1.0))
+
+    verdict = "likely_not_compressed"
+    if score >= 0.6:
+        verdict = "likely_compressed"
+
+    return {
+        "verdict": verdict,
+        "confidence": round(score, 2),
+        "bytes_per_megapixel": bytes_per_mp,
+        "jpeg_quality_estimate": jpeg_quality_est,
+        "software": software,
+        "signals": reasons,
+        "note": "heuristic estimate; not absolute proof of original compression state",
+    }
+
+
+def _parse_confidence_from_reply(raw_reply: str) -> float:
+    for line in raw_reply.splitlines():
+        if line.upper().startswith("CONFIDENCE:"):
+            token = line.split(":", 1)[1].strip().upper()
+            if token == "HIGH":
+                return 0.85
+            if token == "MEDIUM":
+                return 0.65
+            if token == "LOW":
+                return 0.45
+            try:
+                value = float(token)
+                if 0.0 <= value <= 1.0:
+                    return value
+            except Exception:
+                pass
+    return 0.5
 
 
 AGENT_EXECUTION_PROMPTS: dict[str, str] = {
     "upload_agent": "PROMPT: upload_agent running (validate upload). Next -> file_type_classifier_agent",
-    "file_type_classifier_agent": "PROMPT: file_type_classifier_agent running (detect image/video). Next -> image_agent | video_agent | END",
+    "file_type_classifier_agent": "PROMPT: file_type_classifier_agent running (detect image). Next -> image_agent | END",
     "image_agent": "PROMPT: image_agent running (extract image metadata). Next -> ai_detection_agent",
-    "video_agent": "PROMPT: video_agent running (extract video metadata). Next -> ai_detection_agent",
     "ai_detection_agent": "PROMPT: ai_detection_agent running (primary OpenAI analysis). Next -> reverification_agent",
     "reverification_agent": "PROMPT: reverification_agent running (second-pass OpenAI check). Next -> digital_edit_detection_agent",
     "digital_edit_detection_agent": "PROMPT: digital_edit_detection_agent running (ELA + EXIF + GPT-4o edit forensics). Next -> decision_agent",
@@ -203,13 +569,11 @@ def upload_agent(state: MediaPipelineState) -> MediaPipelineState:
 # Agent 2 – File Type Classifier Agent
 
 def file_type_classifier_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Classify the upload as image, video, or unknown for downstream routing."""
+    """Classify the upload as image or unknown for downstream routing."""
     log = _append_log(state, AGENT_EXECUTION_PROMPTS["file_type_classifier_agent"])
     ct = (state.get("content_type") or "").lower()
     if ct in IMAGE_CONTENT_TYPES:
-        media_type: Literal["image", "video", "unknown"] = "image"
-    elif ct in VIDEO_CONTENT_TYPES:
-        media_type = "video"
+        media_type: Literal["image", "unknown"] = "image"
     else:
         media_type = "unknown"
 
@@ -224,9 +588,7 @@ def image_agent(state: MediaPipelineState) -> MediaPipelineState:
     log = _append_log(state, AGENT_EXECUTION_PROMPTS["image_agent"])
     with Image.open(BytesIO(state["file_bytes"])) as img:
         exif_raw = img.getexif()
-        exif: dict[str, str] = (
-            {str(k): str(v) for k, v in exif_raw.items()} if exif_raw else {}
-        )
+        exif: dict[str, str] = _extract_human_readable_exif(exif_raw)
 
         # Basic color statistics for the first three channels
         colour_stats: dict[str, Any] = {}
@@ -245,6 +607,7 @@ def image_agent(state: MediaPipelineState) -> MediaPipelineState:
             "mode": img.mode,
             "width": img.width,
             "height": img.height,
+            "size_bytes": len(state["file_bytes"]),
             "megapixels": round((img.width * img.height) / 1_000_000, 2),
             "aspect_ratio": f"{img.width}:{img.height}",
             "has_transparency": img.mode in ("RGBA", "LA", "P"),
@@ -255,6 +618,25 @@ def image_agent(state: MediaPipelineState) -> MediaPipelineState:
             "sha256": hashlib.sha256(state["file_bytes"]).hexdigest(),
         }
 
+    opencv_meta = _extract_opencv_metadata(state["file_bytes"])
+    exiftool_meta = _extract_exiftool_metadata(
+        state["file_bytes"],
+        state.get("original_filename", "upload.bin"),
+    )
+    metadata["opencv_metadata"] = opencv_meta
+    metadata["exiftool_metadata"] = exiftool_meta
+    metadata["pillow_opencv_difference"] = _build_pillow_opencv_difference(
+        metadata,
+        opencv_meta,
+        metadata.get("exif_data") or {},
+        exiftool_meta,
+    )
+    metadata["authenticity_markers"] = _build_authenticity_markers(metadata)
+    metadata["synthetic_traces"] = _build_synthetic_traces(metadata)
+    metadata["provenance_signals"] = _build_provenance_signals_placeholder()
+    metadata["error_recovery_rate"] = _build_error_recovery_rate_placeholder()
+    metadata["compression_analysis"] = _build_compression_analysis(metadata)
+
     log = _append_log(
         {"processing_log": log},
         f"image_agent: extracted metadata  {img.width}x{img.height}  "
@@ -263,58 +645,10 @@ def image_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"metadata": metadata, "processing_log": log}
 
 
-# Agent 4 – Video Agent
-
-def video_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """Extract video container metadata from binary headers (FFmpeg not required)."""
-    log = _append_log(state, AGENT_EXECUTION_PROMPTS["video_agent"])
-    raw = state["file_bytes"]
-
-    container = "unknown"
-    extra: dict[str, Any] = {}
-
-    # MP4 / MOV: ftyp box at byte 4
-    if len(raw) >= 12 and raw[4:8] == b"ftyp":
-        container = "mp4/mov"
-        brand = raw[8:12].decode("latin-1", errors="ignore").strip()
-        extra["major_brand"] = brand
-    # WebM / MKV: EBML magic
-    elif len(raw) >= 4 and raw[:4] == b"\x1a\x45\xdf\xa3":
-        container = "webm/mkv"
-    # MPEG-1/2 PS: pack start code
-    elif len(raw) >= 4 and raw[:4] == b"\x00\x00\x01\xba":
-        container = "mpeg-ps"
-    # AVI: RIFF....AVI
-    elif len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"AVI ":
-        container = "avi"
-
-    metadata: dict[str, Any] = {
-        "content_type": state.get("content_type"),
-        "filename": state.get("original_filename"),
-        "size_bytes": len(raw),
-        "size_mb": round(len(raw) / (1024 * 1024), 2),
-        "container": container,
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        **extra,
-    }
-
-    log = _append_log(
-        {"processing_log": log},
-        f"video_agent: extracted metadata  size={metadata['size_mb']} MB  "
-        f"container={container}",
-    )
-    return {"metadata": metadata, "processing_log": log}
-
-
-# Agent 5 – AI Detection Agent
+# Agent 4 – AI Detection Agent
 
 def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
-    """
-    Use OpenAI to estimate whether media appears AI-generated.
-
-    • Images  → GPT-4o vision with a base64 data URL
-    • Videos  → GPT-4o text analysis based on extracted metadata
-    """
+    
     from openai import OpenAI  # Local import to avoid module-load side effects.
 
     log = _append_log(state, AGENT_EXECUTION_PROMPTS["ai_detection_agent"])
@@ -324,6 +658,13 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
         return {
             "ai_analysis": "OPENAI_API_KEY not configured; AI detection skipped.",
             "ai_detection_result": "NOT_AI_GENERATED",
+            "ai_confidence": 0.0,
+            "confidence_scores": {
+                "primary_model": 0.0,
+                "note": "model call skipped",
+            },
+            "abstention_threshold": 0.6,
+            "abstained": True,
             "processing_log": log,
         }
 
@@ -334,6 +675,15 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
         img_b64 = base64.b64encode(state["file_bytes"]).decode()
         mime = state.get("content_type") or "image/png"
         data_url = f"data:{mime};base64,{img_b64}"
+        metadata = state.get("metadata") or {}
+        diff_summary = metadata.get("pillow_opencv_difference") or {}
+        exiftool_summary = metadata.get("exiftool_metadata") or {}
+        authenticity_markers = metadata.get("authenticity_markers") or {}
+        synthetic_traces = metadata.get("synthetic_traces") or {}
+        provenance_signals = metadata.get("provenance_signals") or {}
+        error_recovery_rate = metadata.get("error_recovery_rate") or {}
+        compression_analysis = metadata.get("compression_analysis") or {}
+        abstention_threshold = float(state.get("abstention_threshold", 0.6))
 
         response = client.chat.completions.create(
             model="gpt-4o",
@@ -344,11 +694,13 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
                         "type": "text",
                         "text": (
                             "Analyze this image carefully.\n\n"
+                            f"Structured metadata context:\n{json.dumps({'authenticity_markers': authenticity_markers, 'synthetic_traces': synthetic_traces, 'compression_analysis': compression_analysis, 'visual_pixel_artifacts': {'pillow_opencv_difference': diff_summary}, 'semantic_abnormalities': {'text_rendering_abnormalities': 'inspect image text for gibberish/warping'}, 'provenance_signals': provenance_signals, 'error_recovery_rate': error_recovery_rate, 'exiftool_status': {'available': exiftool_summary.get('available'), 'error': exiftool_summary.get('error')}, 'abstention_threshold': abstention_threshold}, indent=2)}\n\n"
                             "1. Determine if it appears AI-generated or photographed.\n"
-                            "2. Identify specific visual artifacts, lighting inconsistencies, "
-                            "unnatural textures, or generative model signatures.\n\n"
+                            "2. Identify specific visual artifacts, lighting inconsistencies, unnatural textures, text rendering abnormalities, or generative model signatures.\n"
+                            "3. If evidence is weak and confidence is below the abstention threshold, state LOW confidence.\n\n"
                             "Respond EXACTLY in this format:\n"
                             "RESULT: AI_GENERATED or NOT_AI_GENERATED\n"
+                            "CONFIDENCE: HIGH or MEDIUM or LOW\n"
                             "CLASSIFICATION: DEEP_FAKE or AI_GENERATED or DIGITALLY_EDITED or REAL or OTHER\n"
                             "ANALYSIS: <concise explanation>"
                         ),
@@ -359,26 +711,28 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
             max_tokens=400,
         )
     else:
-        # For video, send extracted metadata as text context.
-        meta_str = json.dumps(state.get("metadata") or {}, indent=2)
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Based on the video file metadata below, assess whether the file "
-                    "is likely AI-generated or from a real camera.\n\n"
-                    f"```json\n{meta_str}\n```\n\n"
-                    "Respond EXACTLY in this format:\n"
-                    "RESULT: AI_GENERATED or NOT_AI_GENERATED\n"
-                    "CLASSIFICATION: DEEP_FAKE or AI_GENERATED or DIGITALLY_EDITED or REAL or OTHER\n"
-                    "ANALYSIS: <concise explanation>"
-                ),
-            }],
-            max_tokens=400,
-        )
+        log = _append_log({"processing_log": log}, "ai_detection_agent: skipped (non-image media_type)")
+        return {
+            "ai_analysis": "Skipped – not an image.",
+            "ai_detection_result": "NOT_AI_GENERATED",
+            "ai_confidence": 0.0,
+            "confidence_scores": {
+                "primary_model": 0.0,
+                "note": "model call skipped for non-image",
+            },
+            "abstention_threshold": float(state.get("abstention_threshold", 0.6)),
+            "abstained": True,
+            "processing_log": log,
+        }
 
     raw_reply: str = response.choices[0].message.content.strip()
+    confidence = _parse_confidence_from_reply(raw_reply)
+    if media_type == "image":
+        raw_reply = (
+            "DIFF_SUMMARY:\n"
+            f"{json.dumps(diff_summary, indent=2)}\n\n"
+            + raw_reply
+        )
 
     # Parse the structured RESULT line from the model response.
     detection: Literal["AI_GENERATED", "NOT_AI_GENERATED"] = "NOT_AI_GENERATED"
@@ -393,11 +747,17 @@ def ai_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {
         "ai_analysis": raw_reply,
         "ai_detection_result": detection,
+        "ai_confidence": confidence,
+        "confidence_scores": {
+            "primary_model": confidence,
+            "source": "parsed_from_confidence_line_with_heuristic_fallback",
+        },
+        "abstention_threshold": float(state.get("abstention_threshold", 0.6)),
         "processing_log": log,
     }
 
 
-# Agent 6 – Reverification Agent
+# Agent 5 – Reverification Agent
 
 def reverification_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
@@ -410,10 +770,11 @@ def reverification_agent(state: MediaPipelineState) -> MediaPipelineState:
     log = _append_log(state, AGENT_EXECUTION_PROMPTS["reverification_agent"])
     api_key = state.get("openai_api_key") or ""
     if not api_key:
-        log = _append_log({"processing_log": log}, "reverification_agent: OPENAI_API_KEY not set – skipping")
+        log = _append_log({"processing_log": log}, "reverification_agent: OPENAI_API_KEY not set - skipping")
         return {
             "reverification_analysis": state.get("ai_analysis", ""),
             "reverification_result": state.get("ai_detection_result", "NOT_AI_GENERATED"),
+            "reverification_confidence": float(state.get("ai_confidence", 0.0)),
             "processing_log": log,
         }
 
@@ -466,6 +827,7 @@ def reverification_agent(state: MediaPipelineState) -> MediaPipelineState:
         )
 
     raw_reply: str = response.choices[0].message.content.strip()
+    reverification_confidence = _parse_confidence_from_reply(raw_reply)
 
     detection: Literal["AI_GENERATED", "NOT_AI_GENERATED"] = "NOT_AI_GENERATED"
     for line in raw_reply.splitlines():
@@ -497,12 +859,13 @@ def reverification_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {
         "reverification_analysis": raw_reply,
         "reverification_result": detection,
+        "reverification_confidence": reverification_confidence,
         "reverification_classification": reverif_classification,
         "processing_log": log,
     }
 
 
-# Agent 7 – Digital Edit Detection Agent
+# Agent 6 – Digital Edit Detection Agent
 
 def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
@@ -512,8 +875,6 @@ def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineStat
     1. ELA (Error Level Analysis) – JPEG compression inconsistencies
     2. EXIF Software tag – Photoshop / GIMP / Lightroom fingerprint
     3. GPT-4o vision – inspects both the original and the ELA map
-
-    Video files are passed through as NOT_DIGITALLY_EDITED.
     """
     from openai import OpenAI
 
@@ -529,30 +890,70 @@ def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineStat
             "processing_log": log,
         }
 
-    # ── Signal 1: ELA ─────────────────────────────────────────────────────
+    # Signal 1: ELA (existing + script-style comparison)
     ela_score = 0.0
     ela_bytes = b""
+    script_ela_score = 0.0
+    script_ela_bytes = b""
     ela_note = ""
+    ela_comparison: dict[str, Any] = {}
     try:
         ela_score, ela_bytes = _compute_ela(state["file_bytes"])
-        ela_note = f"ELA anomaly_score={ela_score}"
+        script_ela_score, script_ela_bytes = _compute_ela_script_style(state["file_bytes"])
+        delta = round(script_ela_score - ela_score, 4)
+        ela_comparison = {
+            "existing_pipeline": {
+                "quality": 75,
+                "brightness_enhance": 10.0,
+                "output_format": "PNG",
+                "anomaly_score": ela_score,
+            },
+            "script_style": {
+                "quality": 90,
+                "brightness_enhance": 15.0,
+                "output_format": "JPEG",
+                "anomaly_score": script_ela_score,
+            },
+            "score_delta_script_minus_existing": delta,
+            "difference_summary": (
+                "script_style_higher" if delta > 0 else "script_style_lower" if delta < 0 else "equal_scores"
+            ),
+        }
+        ela_note = (
+            f"ELA existing={ela_score} (q75,b10,png) | "
+            f"script_style={script_ela_score} (q90,b15,jpg)"
+        )
     except Exception as exc:
         ela_note = f"ELA failed: {exc}"
+        ela_comparison = {
+            "error": str(exc),
+            "existing_pipeline": {"anomaly_score": ela_score},
+            "script_style": {"anomaly_score": script_ela_score},
+        }
 
-    # ── Signal 2: EXIF software fingerprint ───────────────────────────────
+    #  Signal 2: EXIF software fingerprint 
     exif_data: dict[str, str] = (state.get("metadata") or {}).get("exif_data") or {}
     edited_by_software, sw_name = _detect_editing_software(exif_data)
     exif_note = (
         f"editing_software_detected={edited_by_software}"
         + (f" ({sw_name})" if sw_name else "")
     )
+    metadata = state.get("metadata") or {}
+    diff_summary = metadata.get("pillow_opencv_difference") or {}
+    compression_analysis = metadata.get("compression_analysis") or {}
+    exiftool_meta = metadata.get("exiftool_metadata") or {}
 
     pre_signals = f"{ela_note}  |  {exif_note}"
 
-    # ── Signal 3: GPT-4o vision ───────────────────────────────────────────
+    #  Signal 3: GPT-4o vision
     api_key = state.get("openai_api_key") or ""
     if not api_key:
-        combined_analysis = f"{pre_signals}  |  GPT-4o skipped (no key)"
+        combined_analysis = (
+            f"{pre_signals}\n\n"
+            "ELA_COMPARISON:\n"
+            f"{json.dumps(ela_comparison, indent=2)}\n\n"
+            "GPT-4o skipped (no key)"
+        )
         result: Literal["DIGITALLY_EDITED", "NOT_DIGITALLY_EDITED"] = (
             "DIGITALLY_EDITED" if (edited_by_software or ela_score > 8.0) else "NOT_DIGITALLY_EDITED"
         )
@@ -586,6 +987,16 @@ def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineStat
             f"Computed ELA anomaly score: {ela_score:.2f} (0=clean, >5 suspicious).\n\n"
         )
 
+    if script_ela_bytes:
+        script_ela_b64 = base64.b64encode(script_ela_bytes).decode()
+        ela_image_block.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{script_ela_b64}"}}
+        )
+        ela_context_note += (
+            "The THIRD image is script-style ELA (q90, brightness x15, JPEG output), "
+            "used to compare sensitivity against the pipeline ELA map.\n\n"
+        )
+
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{
@@ -596,6 +1007,12 @@ def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineStat
                     "text": (
                         "You are a forensic image analyst specializing in digital manipulation detection.\n\n"
                         f"Pre-computed signals: {pre_signals}\n\n"
+                        "ELA comparison (existing pipeline vs standalone script style):\n"
+                        f"{json.dumps(ela_comparison, indent=2)}\n\n"
+                        "Compression analysis context:\n"
+                        f"{json.dumps(compression_analysis, indent=2)}\n\n"
+                        "Cross-tool metadata consistency context (Pillow/OpenCV/ExifTool):\n"
+                        f"{json.dumps({'pillow_opencv_difference': diff_summary, 'exiftool_status': {'available': exiftool_meta.get('available'), 'error': exiftool_meta.get('error')}}, indent=2)}\n\n"
                         + ela_context_note
                         + "Examine the image(s) for signs of DIGITAL EDITING:\n"
                         "  • Clone stamping / healing brush artifacts\n"
@@ -636,7 +1053,17 @@ def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineStat
     if edited_by_software and final_result == "NOT_DIGITALLY_EDITED":
         final_result = "DIGITALLY_EDITED"
 
-    combined = f"{pre_signals}\n\nGPT-4o forensic response:\n{raw_reply}"
+    combined = (
+        f"{pre_signals}\n\n"
+        "ELA_COMPARISON:\n"
+        f"{json.dumps(ela_comparison, indent=2)}\n\n"
+        "COMPRESSION_ANALYSIS:\n"
+        f"{json.dumps(compression_analysis, indent=2)}\n\n"
+        "DIFF_SUMMARY:\n"
+        f"{json.dumps(diff_summary, indent=2)}\n\n"
+        "GPT-4o forensic response:\n"
+        f"{raw_reply}"
+    )
     log = _append_log(
         {"processing_log": log},
         f"digital_edit_detection_agent: result={final_result}  ela={ela_score}  exif={edited_by_software}",
@@ -649,12 +1076,12 @@ def digital_edit_detection_agent(state: MediaPipelineState) -> MediaPipelineStat
     }
 
 
-# Agent 8 – Decision Agent
+# Agent 7 – Decision Agent
 
 def decision_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
     Classify media into one of:
-    DEEP_FAKE, AI_GENERATED, DIGITALLY_EDITED, REAL, OTHER.
+    DEEP_FAKE, AI_GENERATED, DIGITALLY_EDITED, REAL, OTHER, ABSTAIN.
 
     Priority:
     1) explicit CLASSIFICATION line from the model output
@@ -664,6 +1091,8 @@ def decision_agent(state: MediaPipelineState) -> MediaPipelineState:
     result = state.get("reverification_result", state.get("ai_detection_result", "NOT_AI_GENERATED"))
     source_analysis = state.get("reverification_analysis") or state.get("ai_analysis") or ""
     raw = source_analysis.upper()
+    threshold = float(state.get("abstention_threshold", 0.6))
+    confidence = float(state.get("reverification_confidence", state.get("ai_confidence", 0.5)))
 
     allowed: tuple[str, ...] = (
         "DEEP_FAKE",
@@ -671,6 +1100,7 @@ def decision_agent(state: MediaPipelineState) -> MediaPipelineState:
         "DIGITALLY_EDITED",
         "REAL",
         "OTHER",
+        "ABSTAIN",
     )
 
     decision: Literal[
@@ -679,7 +1109,16 @@ def decision_agent(state: MediaPipelineState) -> MediaPipelineState:
         "DIGITALLY_EDITED",
         "REAL",
         "OTHER",
+        "ABSTAIN",
     ] = "OTHER"
+
+    if confidence < threshold:
+        decision = "ABSTAIN"
+        log = _append_log(
+            {"processing_log": log},
+            f"decision_agent: abstained (confidence={confidence:.2f} < threshold={threshold:.2f})",
+        )
+        return {"decision": decision, "abstained": True, "processing_log": log}
 
     # Priority 1: DEEP_FAKE from reverification takes absolute precedence.
     reverif_cls = state.get("reverification_classification")
@@ -715,10 +1154,10 @@ def decision_agent(state: MediaPipelineState) -> MediaPipelineState:
             decision = "REAL"
 
     log = _append_log({"processing_log": log}, f"decision_agent: routing decision='{decision}'")
-    return {"decision": decision, "processing_log": log}
+    return {"decision": decision, "abstained": False, "processing_log": log}
 
 
-# Agent 9 – Store File Agent (REAL branch)
+# Agent 8 – Store File Agent (REAL branch)
 
 def store_file_agent(state: MediaPipelineState) -> MediaPipelineState:
     """Save REAL (non-AI) media to the upload directory."""
@@ -736,14 +1175,13 @@ def store_file_agent(state: MediaPipelineState) -> MediaPipelineState:
     return {"stored_file_path": str(dest), "processing_log": log}
 
 
-# Agent 10 – Watermark Agent (AI_GENERATED branch)
+# Agent 9 – Watermark Agent (AI_GENERATED branch)
 
 def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
     """
     Add visible AI-generated marking for flagged media.
 
     • Images  → Pillow alpha-composited banner near the bottom center
-    • Videos  → Original file + JSON sidecar with AI flag details
     """
     log = _append_log(state, AGENT_EXECUTION_PROMPTS["watermark_agent"])
     upload_dir = Path(state["upload_dir"])
@@ -754,77 +1192,56 @@ def watermark_agent(state: MediaPipelineState) -> MediaPipelineState:
     stem = Path(original).stem
     suffix = Path(original).suffix or ".png"
 
-    if media_type == "image":
-        with Image.open(BytesIO(state["file_bytes"])) as img:
-            rgba = img.convert("RGBA")
-            overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
+    if media_type != "image":
+        log = _append_log({"processing_log": log}, "watermark_agent: skipped (non-image)")
+        return {"processing_log": log}
 
-            w, h = rgba.size
-            text = "  AI GENERATED"
-            font_size = max(28, w // 18)
+    with Image.open(BytesIO(state["file_bytes"])) as img:
+        rgba = img.convert("RGBA")
+        overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
 
-            try:
-                # Try a few commonly available system fonts.
-                for face in ("arial.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf"):
-                    try:
-                        font = ImageFont.truetype(face, size=font_size)
-                        break
-                    except (OSError, IOError):
-                        continue
-                else:
-                    font = ImageFont.load_default()
-            except Exception:
+        w, h = rgba.size
+        text = "  AI GENERATED"
+        font_size = max(28, w // 18)
+
+        try:
+            # Try a few commonly available system fonts.
+            for face in ("arial.ttf", "Arial.ttf", "DejaVuSans-Bold.ttf"):
+                try:
+                    font = ImageFont.truetype(face, size=font_size)
+                    break
+                except (OSError, IOError):
+                    continue
+            else:
                 font = ImageFont.load_default()
+        except Exception:
+            font = ImageFont.load_default()
 
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            x = (w - tw) // 2
-            pad = max(14, h // 40)
-            y = h - th - pad * 2
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (w - tw) // 2
+        pad = max(14, h // 40)
+        y = h - th - pad * 2
 
-            # Draw a semi-transparent dark-red banner.
-            draw.rectangle(
-                [0, y - pad, w, y + th + pad],
-                fill=(160, 0, 0, 190),
-            )
-            draw.text((x, y), text, fill=(255, 255, 255, 240), font=font)
-
-            watermarked = Image.alpha_composite(rgba, overlay).convert("RGB")
-            wm_path = _unique_path(upload_dir, stem, suffix, tag="ai_watermarked")
-            watermarked.save(wm_path)
-
-        log = _append_log(
-            {"processing_log": log}, f"watermark_agent: watermarked image saved → {wm_path.name}"
+        # Draw a semi-transparent dark-red banner.
+        draw.rectangle(
+            [0, y - pad, w, y + th + pad],
+            fill=(160, 0, 0, 190),
         )
-        return {"watermarked_file_path": str(wm_path), "processing_log": log}
+        draw.text((x, y), text, fill=(255, 255, 255, 240), font=font)
 
-    else:
-        # For video, save raw bytes and write a JSON sidecar.
-        dest = _unique_path(upload_dir, stem, suffix, tag="ai_flagged")
-        dest.write_bytes(state["file_bytes"])
-        sidecar = dest.with_suffix(".ai_flag.json")
-        sidecar.write_text(
-            json.dumps(
-                {
-                    "flagged_as_ai_generated": True,
-                    "original_filename": original,
-                    "ai_analysis": state.get("ai_analysis"),
-                    "metadata": state.get("metadata"),
-                },
-                indent=2,
-            )
-        )
+        watermarked = Image.alpha_composite(rgba, overlay).convert("RGB")
+        wm_path = _unique_path(upload_dir, stem, suffix, tag="ai_watermarked")
+        watermarked.save(wm_path)
 
-        log = _append_log(
-            {"processing_log": log},
-            f"watermark_agent: AI-flagged video saved → {dest.name}  "
-            f"(sidecar: {sidecar.name})",
-        )
-        return {"watermarked_file_path": str(dest), "processing_log": log}
+    log = _append_log(
+        {"processing_log": log}, f"watermark_agent: watermarked image saved → {wm_path.name}"
+    )
+    return {"watermarked_file_path": str(wm_path), "processing_log": log}
 
 
-# Agent 11 – Store Result Agent
+# Agent 10 – Store Result Agent
 
 def store_result_agent(state: MediaPipelineState) -> MediaPipelineState:
     """Final bookkeeping step that confirms result persistence."""
@@ -834,7 +1251,8 @@ def store_result_agent(state: MediaPipelineState) -> MediaPipelineState:
         {"processing_log": log},
         f"store_result_agent: pipeline complete. watermarked_path={wm}",
     )
-    return {"processing_log": log}
+    ordered_log = _rearrange_log_by_execution(log)
+    return {"processing_log": ordered_log}
 
 
 # Conditional routing helpers
@@ -845,8 +1263,6 @@ def _route_by_media_type(state: MediaPipelineState) -> str:
     mt = state.get("media_type", "unknown")
     if mt == "image":
         return "image_agent"
-    if mt == "video":
-        return "video_agent"
     return END  # type: ignore[return-value]
 
 
@@ -866,7 +1282,6 @@ _builder = StateGraph(MediaPipelineState)
 _builder.add_node("upload_agent", upload_agent)
 _builder.add_node("file_type_classifier_agent", file_type_classifier_agent)
 _builder.add_node("image_agent", image_agent)
-_builder.add_node("video_agent", video_agent)
 _builder.add_node("ai_detection_agent", ai_detection_agent)
 _builder.add_node("reverification_agent", reverification_agent)
 _builder.add_node("digital_edit_detection_agent", digital_edit_detection_agent)
@@ -879,18 +1294,17 @@ _builder.add_node("store_result_agent", store_result_agent)
 _builder.add_edge(START, "upload_agent")
 _builder.add_edge("upload_agent", "file_type_classifier_agent")
 
-# Branch: image/video route, or end on unknown/error.
+# Branch: image route, or end on unknown/error.
 _builder.add_conditional_edges(
     "file_type_classifier_agent",
     _route_by_media_type,
     {
         "image_agent": "image_agent",
-        "video_agent": "video_agent",
         END: END,
     },
 )
 
-# Both media branches converge into AI detection.
+# Image branch converges into AI detection.
 _builder.add_edge("image_agent", "ai_detection_agent")
 _builder.add_edge("digital_edit_detection_agent", "decision_agent")
 _builder.add_edge("ai_detection_agent", "reverification_agent")

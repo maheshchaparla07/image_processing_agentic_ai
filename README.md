@@ -1,12 +1,10 @@
 # Image Detector API
 
-This project is a FastAPI backend that accepts uploaded media, analyzes it, and tells you whether it likely came from AI generation or a real capture.
-
-Even though the repository name says “image detector”, the current API handles both images and videos through one shared pipeline.
+This project is a FastAPI backend that accepts uploaded images, analyzes them, and tells you whether they likely came from AI generation or a real capture.
 
 ## What this project gives you
 
-You can upload a media file and get back:
+You can upload an image file and get back:
 
 - extracted metadata
 - AI analysis text from OpenAI
@@ -49,7 +47,7 @@ Main flow entrypoint:
 This endpoint:
 
 1. validates file type
-2. validates file size (image/video limits differ)
+2. validates file size
 3. runs the LangGraph pipeline in a worker thread
 4. tries to persist a record in DB
 5. returns a structured response
@@ -62,10 +60,8 @@ The pipeline lives in `app/services/media_pipeline_graph.py`.
 flowchart TD
     A[Upload request] --> B[Upload Agent]
     B --> C[File Type Classifier]
-    C -->|image| D[Image Agent]
-    C -->|video| E[Video Agent]
+    C --> D[Image Agent]
     D --> F[AI Detection Agent]
-    E --> F
     F --> G[Decision Agent]
     G -->|REAL| H[Store File Agent]
     G -->|AI_GENERATED| I[Watermark Agent]
@@ -80,45 +76,39 @@ Checks that bytes and filename exist, then starts the processing log.
 
 ### Agent 2: File Type Classifier
 
-Classifies upload as `image`, `video`, or `unknown` based on MIME type.
+Classifies upload as `image` or `unknown` based on MIME type.
 
 ### Agent 3: Image Agent
 
 Extracts image details like dimensions, mode, EXIF presence/data, color stats, and SHA-256 hash.
 
-### Agent 4: Video Agent
-
-Performs lightweight binary/container inspection (no FFmpeg), then records file stats and SHA-256 hash.
-
-### Agent 5: AI Detection Agent
+### Agent 4: AI Detection Agent
 
 - Images are sent for vision-style analysis.
-- Videos are analyzed from extracted metadata text.
 
 If `OPENAI_API_KEY` is missing, analysis is skipped gracefully and defaults to:
 
 - `ai_detection_result = NOT_AI_GENERATED`
 - decision = `REAL`
 
-### Agent 6: Decision Agent
+### Agent 5: Decision Agent
 
 Maps AI output to business decision:
 
 - `NOT_AI_GENERATED` → `REAL`
 - `AI_GENERATED` → `AI_GENERATED`
 
-### Agent 7: Store File Agent
+### Agent 6: Store File Agent
 
 If decision is `REAL`, saves the original media.
 
-### Agent 8: Watermark Agent
+### Agent 7: Watermark Agent
 
 If decision is `AI_GENERATED`:
 
 - images get an `AI GENERATED` banner
-- videos are saved with a JSON sidecar flag file
 
-### Agent 9: Store Result Agent
+### Agent 8: Store Result Agent
 
 Final bookkeeping step; confirms completion in the processing log.
 
@@ -152,18 +142,9 @@ Allowed image MIME types:
 - `image/gif`
 - `image/webp`
 
-Allowed video MIME types:
-
-- `video/mp4`
-- `video/mpeg`
-- `video/quicktime`
-- `video/x-msvideo`
-- `video/webm`
-
 Size limits:
 
 - images: **10 MB**
-- videos: **100 MB**
 
 ### Auth (placeholder)
 
@@ -368,7 +349,7 @@ When a file is uploaded, runtime sequence is:
 6. metadata extraction happens
 7. AI detection runs (or is skipped if no key)
 8. decision is made (`REAL` or `AI_GENERATED`)
-9. file is stored (plain or watermarked/flagged)
+9. image is stored (plain or watermarked)
 10. DB save is attempted
 11. structured response is returned
 
@@ -385,7 +366,6 @@ When a file is uploaded, runtime sequence is:
 - user endpoints are placeholders
 - no frontend in this repo
 - `alembic/` exists but migrations are not defined yet
-- video detection is metadata-based (not frame-level)
 - AI detection is skipped when `OPENAI_API_KEY` is missing
 
 ## Good next steps
@@ -394,7 +374,6 @@ When a file is uploaded, runtime sequence is:
 - wire user endpoints to service/repository
 - add DB migrations
 - add upload test coverage
-- add frame extraction for deeper video checks
 - record richer scoring/audit detail
 
 ## Short summary

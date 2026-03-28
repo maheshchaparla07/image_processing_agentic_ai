@@ -14,13 +14,13 @@ class Image(Base):
     filename = Column(String, nullable=False)
     content_type = Column(String, nullable=True)
     size_bytes = Column(Integer, nullable=True)
-    media_type = Column(String(10), nullable=True)   # 'image' | 'video' | 'unknown'
+    media_type = Column(String(10), nullable=True)   # 'image' | 'unknown'
 
     #  Pipeline outputs
     metadata_json = Column(Text, nullable=True)          # JSON-serialised metadata dict
     ai_analysis = Column(Text, nullable=True)            # raw OpenAI reply
     ai_detection_result = Column(String(20), nullable=True)  # AI_GENERATED | NOT_AI_GENERATED
-    decision = Column(String(20), nullable=True)         # DEEP_FAKE | AI_GENERATED | DIGITALLY_EDITED | REAL | OTHER
+    decision = Column(String(20), nullable=True)         # DEEP_FAKE | AI_GENERATED | DIGITALLY_EDITED | REAL | OTHER | ABSTAIN
 
     #  Storage paths 
     stored_file_path = Column(String, nullable=True)     # REAL branch

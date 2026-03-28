@@ -12,7 +12,7 @@ class MediaResponse(BaseModel):
     size_bytes: Optional[int] = None
 
     # Pipeline outputs.
-    media_type: Optional[Literal["image", "video", "unknown"]] = None
+    media_type: Optional[Literal["image", "unknown"]] = None
     metadata: Optional[dict[str, Any]] = None
     ai_analysis: Optional[str] = None
     ai_detection_result: Optional[Literal["AI_GENERATED", "NOT_AI_GENERATED"]] = None
@@ -23,6 +23,7 @@ class MediaResponse(BaseModel):
             "DIGITALLY_EDITED",
             "REAL",
             "OTHER",
+            "ABSTAIN",
         ]
     ] = None
 

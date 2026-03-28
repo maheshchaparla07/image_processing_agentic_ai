@@ -1,12 +1,11 @@
 """
 Media upload endpoint (`/api/v1/media/upload`).
 
-Accepts image and video files, then runs the complete 9-agent LangGraph pipeline:
+Accepts image files and runs the complete pipeline:
 
-    Upload Agent → File Type Classifier
-             ├── Image Agent → AI Detection → Decision
-             │                                   ├── REAL          → Store File
-             └── Video Agent → AI Detection →    └── AI_GENERATED → Watermark → Store Result
+    Upload Agent → File Type Classifier → Image Agent → AI Detection
+                → Reverification → Digital Edit Detection → Decision
+                → (REAL → Store File) | (Suspicious → Watermark → Store Result)
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from app.core.config import (
     ALLOWED_MEDIA_TYPES,
     MAX_IMAGE_SIZE_MB,
-    MAX_VIDEO_SIZE_MB,
     OPENAI_API_KEY,
     UPLOAD_DIR,
 )
@@ -40,16 +38,16 @@ Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 @router.post(
     "/upload",
     response_model=MediaResponse,
-    summary="Upload image or video for AI analysis",
+    summary="Upload image for AI analysis",
 )
 async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
     """
-    Accept an image (JPEG, PNG, GIF, WebP) or video (MP4, MPEG, MOV, AVI, WebM).
+    Accept an image (JPEG, PNG, GIF, WebP).
 
     Runs the full pipeline and returns:
     - extracted metadata
     - OpenAI analysis
-    - decision (`DEEP_FAKE`, `AI_GENERATED`, `DIGITALLY_EDITED`, `REAL`, or `OTHER`)
+    - decision (`DEEP_FAKE`, `AI_GENERATED`, `DIGITALLY_EDITED`, `REAL`, `OTHER`, or `ABSTAIN`)
     - output path (`stored_file_path` or `watermarked_file_path`)
     - full processing log
     """
@@ -67,13 +65,11 @@ async def upload_media(file: UploadFile = File(...)) -> MediaResponse:
     content = await file.read()
     size_bytes = len(content)
 
-    # Validate size (images and videos have different limits).
-    is_video = content_type.startswith("video/")
-    max_mb = MAX_VIDEO_SIZE_MB if is_video else MAX_IMAGE_SIZE_MB
-    if size_bytes > max_mb * 1024 * 1024:
+    # Validate size.
+    if size_bytes > MAX_IMAGE_SIZE_MB * 1024 * 1024:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large. Maximum allowed size is {max_mb} MB.",
+            detail=f"File too large. Maximum allowed size is {MAX_IMAGE_SIZE_MB} MB.",
         )
 
     # Run the pipeline in a worker thread to keep the event loop responsive.
